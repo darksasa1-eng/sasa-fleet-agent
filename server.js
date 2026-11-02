@@ -206,6 +206,16 @@ async function startEntry(item, input) {
   const projectRoot = input.rootDirectory ? path.join(item.dir, ...String(input.rootDirectory).split("/").filter(Boolean)) : item.dir;
   const port = item.projectType === "node" ? input.port || freePort() : null;
 
+  if (input.install !== false && item.projectType === "python" && fs.existsSync(path.join(projectRoot, "requirements.txt"))) {
+    pushLog(item, "Installing Python dependencies", "system");
+    const pipCode = await run("python3", ["-m", "pip", "install", "--no-warn-script-location", "-r", "requirements.txt"], {
+      cwd: projectRoot,
+      timeoutMs: 420000,
+      onLine: (line) => pushLog(item, line, "info"),
+    });
+    pushLog(item, `Python install finished with exit code ${pipCode}`, pipCode === 0 ? "system" : "warn");
+  }
+
   if (input.install !== false && fs.existsSync(path.join(projectRoot, "package.json"))) {
     pushLog(item, "Installing dependencies", "system");
     const installCode = await run("npm", ["install", "--omit=dev", "--no-audit", "--no-fund"], {
