@@ -204,7 +204,7 @@ async function startEntry(item, input) {
   }
   item.projectType = input.projectType || "node";
   const projectRoot = input.rootDirectory ? path.join(item.dir, ...String(input.rootDirectory).split("/").filter(Boolean)) : item.dir;
-  const port = item.projectType === "node" ? input.port || freePort() : null;
+  const port = item.projectType === "worker" ? null : input.port || freePort();
 
   if (input.install !== false && item.projectType === "python" && fs.existsSync(path.join(projectRoot, "requirements.txt"))) {
     pushLog(item, "Installing Python dependencies", "system");
