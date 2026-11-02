@@ -1,0 +1,13 @@
+{
+  "name": "sasa-fleet-agent",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Runtime host agent for Sasa Dev Hostings server pool",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": "22.x"
+  }
+}
