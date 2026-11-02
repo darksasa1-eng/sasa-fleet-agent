@@ -314,47 +314,79 @@ async function readText(file) {
   }
 }
 
-async function metrics() {
-  const load = os.loadavg();
-  const totalMem = os.totalmem();
-  const freeMem = os.freemem();
-  let limitBytes = null;
-  const max = await readText("/sys/fs/cgroup/memory.max");
-  if (max && max !== "max") limitBytes = Number(max);
-  if (!limitBytes) {
-    const v1 = await readText("/sys/fs/cgroup/memory/memory.limit_in_bytes");
-    if (v1 && Number(v1) < 1e15) limitBytes = Number(v1);
+async function cgroupMemory() {
+  const currentV2 = await readText("/sys/fs/cgroup/memory.current");
+  const maxV2 = await readText("/sys/fs/cgroup/memory.max");
+  if (currentV2) {
+    const used = Number(currentV2);
+    const limit = maxV2 && maxV2 !== "max" ? Number(maxV2) : null;
+    return { usedBytes: used, limitBytes: limit, source: "cgroup-v2" };
   }
-  const usedBytes = limitBytes ? totalMem - freeMem : totalMem - freeMem;
-  let cpuPercent = 0;
-  if (lastSample) {
-    const elapsed = Math.max(300, Date.now() - lastSample.at);
-    const idle = os.cpus().reduce((sum, cpu) => sum + cpu.times.idle, 0);
-    const total = os.cpus().reduce((sum, cpu) => {
-      const t = cpu.times;
-      return sum + t.user + t.nice + t.sys + t.idle + t.irq;
-    }, 0);
-    const idleDelta = idle - lastSample.idle;
-    const totalDelta = total - lastSample.total;
-    if (totalDelta > 0) cpuPercent = Math.max(0, Math.min(100, Number(((1 - idleDelta / totalDelta) * 100).toFixed(1))));
-    void elapsed;
+  const currentV1 = await readText("/sys/fs/cgroup/memory/memory.usage_in_bytes");
+  const maxV1 = await readText("/sys/fs/cgroup/memory/memory.limit_in_bytes");
+  if (currentV1) {
+    const used = Number(currentV1);
+    const limit = maxV1 && Number(maxV1) < 1e15 ? Number(maxV1) : null;
+    return { usedBytes: used, limitBytes: limit, source: "cgroup-v1" };
   }
-  const idleNow = os.cpus().reduce((sum, cpu) => sum + cpu.times.idle, 0);
-  const totalNow = os.cpus().reduce((sum, cpu) => {
-    const t = cpu.times;
-    return sum + t.user + t.nice + t.sys + t.idle + t.irq;
-  }, 0);
-  if (!lastSample) {
-    lastSample = { at: Date.now(), idle: idleNow, total: totalNow };
-  } else {
-    lastSample = { at: Date.now(), idle: idleNow, total: totalNow };
-  }
+  return { usedBytes: os.totalmem() - os.freemem(), limitBytes: null, source: "proc" };
+}
 
+async function cgroupCpu() {
+  const v2 = await readText("/sys/fs/cgroup/cpu.stat");
+  const maxLine = await readText("/sys/fs/cgroup/cpu.max");
+  if (v2) {
+    const line = v2.split("\n").find((row) => row.startsWith("usage_usec"));
+    let quotaCores = null;
+    if (maxLine && !maxLine.startsWith("max")) {
+      const [quota, period] = maxLine.split(/\s+/);
+      const q = Number(quota);
+      const p = Number(period);
+      if (Number.isFinite(q) && Number.isFinite(p) && p > 0) quotaCores = q / p;
+    }
+    return { usageUsec: line ? Number(line.split(/\s+/)[1]) : null, quotaCores };
+  }
+  const v1 = await readText("/sys/fs/cgroup/cpuacct/cpuacct.usage");
+  if (v1) return { usageUsec: Math.round(Number(v1) / 1000), quotaCores: null };
+  return { usageUsec: null, quotaCores: null };
+}
+
+function processCpuUsec() {
+  let ticks = 0;
+  try {
+    const entries = fs.readdirSync("/proc");
+    for (const entry of entries) {
+      if (!/^\d+$/.test(entry)) continue;
+      try {
+        const raw = fs.readFileSync(`/proc/${entry}/stat`, "utf8");
+        const close = raw.lastIndexOf(")");
+        const fields = raw.slice(close + 2).split(/\s+/);
+        ticks += Number(fields[11] || 0) + Number(fields[12] || 0);
+      } catch {
+        void 0;
+      }
+    }
+  } catch {
+    return null;
+  }
+  return Math.round((ticks / 100) * 1e6);
+}
+
+async function metrics() {
+  const memory = await cgroupMemory();
+  const cpu = await cgroupCpu();
+  const usageUsec = cpu.usageUsec !== null ? cpu.usageUsec : processCpuUsec();
+  const quota = cpu.quotaCores || 1;
+  const now = Date.now();
+
+  let cpuPercent = 0;
+  let netRxPerSec = 0;
+  let netTxPerSec = 0;
   let rx = 0;
   let tx = 0;
-  const net = await readText("/proc/net/dev");
-  if (net) {
-    for (const line of net.split("\n").slice(2)) {
+  const netRaw = await readText("/proc/net/dev");
+  if (netRaw) {
+    for (const line of netRaw.split("\n").slice(2)) {
       const [iface, rest] = line.split(":");
       if (!iface || !rest) continue;
       if (iface.trim() === "lo") continue;
@@ -364,21 +396,37 @@ async function metrics() {
     }
   }
 
+  if (lastSample && usageUsec !== null && lastSample.usageUsec !== null) {
+    const elapsedMs = Math.max(400, now - lastSample.at);
+    const deltaUsec = Math.max(0, usageUsec - lastSample.usageUsec);
+    cpuPercent = Math.min(100, Number(((deltaUsec / 1000 / elapsedMs / quota) * 100).toFixed(1)));
+    netRxPerSec = Math.max(0, Math.round(((rx - lastSample.rx) / elapsedMs) * 1000));
+    netTxPerSec = Math.max(0, Math.round(((tx - lastSample.tx) / elapsedMs) * 1000));
+  }
+  lastSample = { at: now, usageUsec, rx, tx };
+
+  const ramUsedMb = Math.round(memory.usedBytes / 1048576);
+  const ramLimitMb = memory.limitBytes ? Math.round(memory.limitBytes / 1048576) : null;
+  const running = Array.from(apps.values()).filter((item) => item.state === "running" || item.state === "starting").length;
+
   return {
     server: SERVER_NAME,
-    at: new Date().toISOString(),
+    at: new Date(now).toISOString(),
     uptimeSeconds: Math.round((Date.now() - startedAt) / 1000),
     hostUptimeSeconds: Math.round(os.uptime()),
     cpuPercent,
     cpuCores: os.cpus().length,
-    loadAverage: load.map((value) => Number(value.toFixed(2))),
-    ramUsedMb: Math.round(usedBytes / 1048576),
-    ramTotalMb: Math.round(totalMem / 1048576),
-    ramLimitMb: limitBytes ? Math.round(limitBytes / 1048576) : null,
-    memoryFreeMb: Math.round(freeMem / 1048576),
+    cpuQuotaCores: Number(quota.toFixed(2)),
+    loadAverage: os.loadavg().map((value) => Number(value.toFixed(2))),
+    ramUsedMb,
+    ramLimitMb,
+    ramTotalMb: ramLimitMb || Math.round(os.totalmem() / 1048576),
+    ramPercent: ramLimitMb ? Number(((ramUsedMb / ramLimitMb) * 100).toFixed(1)) : 0,
+    memorySource: memory.source,
     disk: await diskUsage(),
-    network: { rxBytes: rx, txBytes: tx },
+    network: { rxBytes: rx, txBytes: tx, rxPerSec: netRxPerSec, txPerSec: netTxPerSec },
     runtime: "node " + process.version,
+    appsRunning: running,
     apps: Array.from(apps.values()).map((item) => ({
       slug: item.slug,
       state: item.state,
