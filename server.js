@@ -314,69 +314,81 @@ async function readText(file) {
   }
 }
 
-async function cgroupMemory() {
-  const currentV2 = await readText("/sys/fs/cgroup/memory.current");
-  const maxV2 = await readText("/sys/fs/cgroup/memory.max");
-  if (currentV2) {
-    const used = Number(currentV2);
-    const limit = maxV2 && maxV2 !== "max" ? Number(maxV2) : null;
-    return { usedBytes: used, limitBytes: limit, source: "cgroup-v2" };
-  }
-  const currentV1 = await readText("/sys/fs/cgroup/memory/memory.usage_in_bytes");
-  const maxV1 = await readText("/sys/fs/cgroup/memory/memory.limit_in_bytes");
-  if (currentV1) {
-    const used = Number(currentV1);
-    const limit = maxV1 && Number(maxV1) < 1e15 ? Number(maxV1) : null;
-    return { usedBytes: used, limitBytes: limit, source: "cgroup-v1" };
-  }
-  return { usedBytes: os.totalmem() - os.freemem(), limitBytes: null, source: "proc" };
-}
-
-async function cgroupCpu() {
-  const v2 = await readText("/sys/fs/cgroup/cpu.stat");
-  const maxLine = await readText("/sys/fs/cgroup/cpu.max");
-  if (v2) {
-    const line = v2.split("\n").find((row) => row.startsWith("usage_usec"));
-    let quotaCores = null;
-    if (maxLine && !maxLine.startsWith("max")) {
-      const [quota, period] = maxLine.split(/\s+/);
-      const q = Number(quota);
-      const p = Number(period);
-      if (Number.isFinite(q) && Number.isFinite(p) && p > 0) quotaCores = q / p;
-    }
-    return { usageUsec: line ? Number(line.split(/\s+/)[1]) : null, quotaCores };
-  }
-  const v1 = await readText("/sys/fs/cgroup/cpuacct/cpuacct.usage");
-  if (v1) return { usageUsec: Math.round(Number(v1) / 1000), quotaCores: null };
-  return { usageUsec: null, quotaCores: null };
-}
-
-function processCpuUsec() {
-  let ticks = 0;
+function ownProcessPids() {
+  const groupLeaders = new Set();
+  for (const item of apps.values()) if (item.child && item.child.pid) groupLeaders.add(item.child.pid);
+  const pids = [];
+  let entries = [];
   try {
-    const entries = fs.readdirSync("/proc");
-    for (const entry of entries) {
-      if (!/^\d+$/.test(entry)) continue;
-      try {
-        const raw = fs.readFileSync(`/proc/${entry}/stat`, "utf8");
-        const close = raw.lastIndexOf(")");
-        const fields = raw.slice(close + 2).split(/\s+/);
-        ticks += Number(fields[11] || 0) + Number(fields[12] || 0);
-      } catch {
-        void 0;
-      }
-    }
+    entries = fs.readdirSync("/proc");
   } catch {
-    return null;
+    return { pids, groupLeaders };
   }
-  return Math.round((ticks / 100) * 1e6);
+  for (const entry of entries) {
+    if (!/^\d+$/.test(entry)) continue;
+    const pid = Number(entry);
+    if (pid === process.pid) {
+      pids.push(pid);
+      continue;
+    }
+    try {
+      const raw = fs.readFileSync(`/proc/${entry}/stat`, "utf8");
+      const close = raw.lastIndexOf(")");
+      const fields = raw.slice(close + 2).split(/\s+/);
+      const pgrp = Number(fields[2]);
+      if (groupLeaders.has(pgrp) || groupLeaders.has(pid)) pids.push(pid);
+    } catch {
+      void 0;
+    }
+  }
+  return { pids, groupLeaders };
+}
+
+function processTreeUsage() {
+  const { pids } = ownProcessPids();
+  let rssBytes = 0;
+  let ticks = 0;
+  for (const pid of pids) {
+    try {
+      const status = fs.readFileSync(`/proc/${pid}/status`, "utf8");
+      const line = status.split("\n").find((row) => row.startsWith("VmRSS:"));
+      if (line) rssBytes += Number(line.split(/\s+/)[1]) * 1024;
+    } catch {
+      void 0;
+    }
+    try {
+      const raw = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
+      const close = raw.lastIndexOf(")");
+      const fields = raw.slice(close + 2).split(/\s+/);
+      ticks += Number(fields[11] || 0) + Number(fields[12] || 0);
+    } catch {
+      void 0;
+    }
+  }
+  return { rssBytes, cpuUsec: Math.round((ticks / 100) * 1e6), processes: pids.length };
+}
+
+async function cgroupLimitMb() {
+  const envLimit = Number(process.env.FLEET_RAM_LIMIT_MB || 0);
+  if (Number.isFinite(envLimit) && envLimit > 64) return envLimit;
+  const maxV2 = await readText("/sys/fs/cgroup/memory.max");
+  if (maxV2 && maxV2 !== "max") {
+    const value = Number(maxV2);
+    if (Number.isFinite(value) && value > 0 && value < 4 * 1024 * 1024 * 1024) return Math.round(value / 1048576);
+  }
+  const maxV1 = await readText("/sys/fs/cgroup/memory/memory.limit_in_bytes");
+  if (maxV1) {
+    const value = Number(maxV1);
+    if (Number.isFinite(value) && value > 0 && value < 4 * 1024 * 1024 * 1024) return Math.round(value / 1048576);
+  }
+  return 512;
 }
 
 async function metrics() {
-  const memory = await cgroupMemory();
-  const cpu = await cgroupCpu();
-  const usageUsec = cpu.usageUsec !== null ? cpu.usageUsec : processCpuUsec();
-  const quota = cpu.quotaCores || 1;
+  const tree = processTreeUsage();
+  const usageUsec = tree.cpuUsec;
+  const quota = 1;
+  const ramLimitMb = await cgroupLimitMb();
   const now = Date.now();
 
   let cpuPercent = 0;
@@ -405,8 +417,7 @@ async function metrics() {
   }
   lastSample = { at: now, usageUsec, rx, tx };
 
-  const ramUsedMb = Math.round(memory.usedBytes / 1048576);
-  const ramLimitMb = memory.limitBytes ? Math.round(memory.limitBytes / 1048576) : null;
+  const ramUsedMb = Math.round(tree.rssBytes / 1048576);
   const running = Array.from(apps.values()).filter((item) => item.state === "running" || item.state === "starting").length;
 
   return {
@@ -420,11 +431,12 @@ async function metrics() {
     loadAverage: os.loadavg().map((value) => Number(value.toFixed(2))),
     ramUsedMb,
     ramLimitMb,
-    ramTotalMb: ramLimitMb || Math.round(os.totalmem() / 1048576),
+    ramTotalMb: ramLimitMb,
     ramPercent: ramLimitMb ? Number(((ramUsedMb / ramLimitMb) * 100).toFixed(1)) : 0,
-    memorySource: memory.source,
+    memorySource: "process-tree",
     disk: await diskUsage(),
     network: { rxBytes: rx, txBytes: tx, rxPerSec: netRxPerSec, txPerSec: netTxPerSec },
+    processes: tree.processes,
     runtime: "node " + process.version,
     appsRunning: running,
     apps: Array.from(apps.values()).map((item) => ({
