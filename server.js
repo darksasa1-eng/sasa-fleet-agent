@@ -502,8 +502,9 @@ async function proxyToApp(req, res, item, subPath) {
   }
   const target = `http://127.0.0.1:${item.port}${subPath}`;
   const headers = { ...req.headers };
-  delete headers.host;
-  delete headers["content-length"];
+  for (const key of ["host", "content-length", "transfer-encoding", "connection", "keep-alive", "upgrade", "x-fleet-token", "accept-encoding"]) {
+    delete headers[key];
+  }
   const body = req.method === "GET" || req.method === "HEAD" ? undefined : await readBody(req, 25 * 1024 * 1024).catch(() => null);
   try {
     const upstream = await fetch(target, {
